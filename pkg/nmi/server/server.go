@@ -73,6 +73,7 @@ func (s *Server) Run() error {
 	mux.Handle("/metadata/identity/oauth2/token/", appHandler(s.msiHandler))
 	mux.Handle("/host/token", appHandler(s.hostHandler))
 	mux.Handle("/host/token/", appHandler(s.hostHandler))
+	mux.Handle("/metadata/instance", appHandler(s.instanceHandler))
 	mux.Handle("/", appHandler(s.defaultPathHandler))
 
 	log.Infof("Listening on port %s", s.NMIPort)
@@ -419,6 +420,60 @@ func parseRequestClientIDAndResource(r *http.Request) (clientID string, resource
 		resource = vals.Get("resource")
 	}
 	return clientID, resource
+}
+
+// instanceHandler redacts sensitive data from the instance endpoint response
+func (s *Server) instanceHandler(logger *log.Entry, w http.ResponseWriter, r *http.Request) {
+	client := &http.Client{}
+	req, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+	if err != nil || req == nil {
+		logger.Errorf("failed creating a new request, %s %+v", r.URL.String(), err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	host := fmt.Sprintf("%s:%s", s.MetadataIP, s.MetadataPort)
+	req.Host = host
+	req.URL.Host = host
+	req.URL.Scheme = "http"
+	if r.Header != nil {
+		copyHeader(req.Header, r.Header)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Errorf("failed executing request, %s %+v", req.URL.String(), err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer func() {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+	}()
+
+	var instanceMetadata map[string]map[string]interface{}
+	err = json.NewDecoder(r.Body).Decode(&instanceMetadata)
+	if err != nil {
+		logger.Errorf("failed decoding response to request, %s %+v", req.URL.String(), err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Redact customData, which may contain cloud-init secrets
+	if computeMetadata, ok := instanceMetadata["compute"]; ok {
+		if _, ok := computeMetadata["customData"]; ok {
+			computeMetadata["customData"] = ""
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	body, err := json.Marshal(instanceMetadata)
+	if err != nil {
+		logger.Errorf("failed decoding response to request, %s %+v", req.URL.String(), err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Write(body)
 }
 
 // defaultPathHandler creates a new request and returns the response body and code
